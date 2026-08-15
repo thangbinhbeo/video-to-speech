@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Output files (keep the folder, ignore contents)
+output/*
+!output/.gitkeep
+
+# Input files (keep the folder, ignore contents)
+input/*
+!input/.gitkeep
+
+# Whisper model cache
+*.pt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# uv lock file (keep this tracked)
+# uv.lock

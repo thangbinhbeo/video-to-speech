@@ -1,0 +1,20 @@
+[project]
+name = "video-to-speech"
+version = "1.0.0"
+description = "Transcribe video/audio to text using OpenAI Whisper — runs 100% locally, no API keys needed."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "openai-whisper",
+]
+
+[project.scripts]
+transcribe = "video_to_speech.transcribe:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/video_to_speech"]
