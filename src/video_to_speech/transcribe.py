@@ -1,12 +1,15 @@
 """
-Transcribe video/audio to text using OpenAI Whisper — runs 100% locally.
+Transcribe video/audio to text using faster-whisper — runs 100% locally.
+
+Uses CTranslate2 backend for 4-8x faster inference and ~4x less RAM than
+openai-whisper. Includes Silero VAD (Voice Activity Detection) to skip
+silent segments and prevent hallucination.
 
 Supports single file or batch mode (entire directory).
 Outputs: timestamped transcript (.txt), plain text (.txt), subtitles (.srt).
 """
 
 import argparse
-import glob
 import json
 import os
 import subprocess
@@ -127,6 +130,67 @@ def collect_media_files(directory: str) -> list[str]:
     return files
 
 
+def filter_hallucination(segments: list[dict], max_repeat: int = 3) -> list[dict]:
+    """Clean hallucinated segments using two strategies:
+
+    1. Keyword filter: replace segments matching known Whisper hallucination patterns
+       (e.g., "subscribe cho kênh", "đăng ký kênh") with a "[... không nghe rõ ...]"
+       placeholder — these are artifacts from YouTube training data.
+    2. Repeat filter: replace segments that repeat consecutively > max_repeat times.
+
+    Segments are kept (with replaced text) to preserve the timeline.
+    """
+    PLACEHOLDER = "[... không nghe rõ ...]"
+
+    # Known hallucination phrases (lowercase, partial match)
+    HALLUCINATION_PATTERNS = [
+        "subscribe cho kênh",
+        "đăng ký kênh",
+        "đăng kí cho kênh",
+        "không bỏ lỡ những video",
+        "ủng hộ kênh của mình",
+        "ủng hộ kênh mình",
+    ]
+
+    cleaned = []
+    repeat_count = 0
+    prev_text = None
+    keyword_replaced = 0
+    repeat_replaced = 0
+
+    for seg in segments:
+        text = seg["text"].strip()
+        text_lower = text.lower()
+        new_seg = dict(seg)  # shallow copy to avoid mutating original
+
+        # Strategy 1: keyword filter
+        if any(pattern in text_lower for pattern in HALLUCINATION_PATTERNS):
+            new_seg["text"] = PLACEHOLDER
+            keyword_replaced += 1
+            cleaned.append(new_seg)
+            continue
+
+        # Strategy 2: repeat filter
+        if text == prev_text:
+            repeat_count += 1
+        else:
+            repeat_count = 1
+            prev_text = text
+
+        if repeat_count > max_repeat:
+            new_seg["text"] = PLACEHOLDER
+            repeat_replaced += 1
+
+        cleaned.append(new_seg)
+
+    total = keyword_replaced + repeat_replaced
+    if total:
+        print(f"   🧹 Replaced {total} unclear segments with '{PLACEHOLDER}'"
+              f" (keyword: {keyword_replaced}, repeat: {repeat_replaced})")
+
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Core transcription
 # ---------------------------------------------------------------------------
@@ -149,42 +213,57 @@ def transcribe_file(
     else:
         print("⚠  Could not detect duration (missing ffprobe?). No progress bar.")
 
-    print(f"🎙  Transcribing...")
+    print(f"🎙  Transcribing (with VAD filtering)...")
     start = time.time()
 
-    # Disable Whisper's built-in verbose output; we show our own progress bar
-    transcribe_kwargs = {"verbose": False}
-    if language:
-        transcribe_kwargs["language"] = language
+    # --- faster-whisper transcribe ---
+    # VAD (Voice Activity Detection) via Silero: tự phát hiện đoạn im lặng,
+    # skip luôn → tránh hallucination + nhanh hơn đáng kể.
+    transcribe_kwargs = {
+        "language": language if language else None,
+        "condition_on_previous_text": False,   # Không dùng text trước làm context → phá vòng lặp hallucination
+        "no_speech_threshold": 0.6,            # Ngưỡng phát hiện đoạn không có tiếng nói
+        "log_prob_threshold": -1.0,            # Lọc output confidence thấp
+        "compression_ratio_threshold": 2.4,    # Loại đoạn lặp lại bất thường
+        # --- VAD settings (Silero) ---
+        "vad_filter": True,                    # BẬT VAD — killer feature chống hallucination
+        "vad_parameters": {
+            "min_silence_duration_ms": 500,    # Đoạn im lặng >= 500ms sẽ bị skip
+            "speech_pad_ms": 300,              # Thêm 300ms padding quanh đoạn có tiếng nói
+            "threshold": 0.5,                  # Ngưỡng VAD (0-1, cao hơn = strict hơn)
+        },
+    }
 
-    # Monkey-patch model.decode to count 30s chunks and update progress bar
+    segments_gen, info = model.transcribe(input_file, **transcribe_kwargs)
+
+    print(f"   Detected language: {info.language} (probability: {info.language_probability:.2f})")
+
+    # Iterate segments (generator) and collect results with progress bar
+    segments = []
+    for seg in segments_gen:
+        seg_dict = {
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text,
+        }
+        segments.append(seg_dict)
+
+        # Update progress bar
+        if total_duration:
+            print_progress(seg.end, total_duration, start)
+
     if total_duration:
-        _orig_decode = model.decode
-        chunk_i = [0]
-
-        def _patched_decode(*a, **kw):
-            res = _orig_decode(*a, **kw)
-            chunk_i[0] += 1
-            seg_end = min(chunk_i[0] * 30, total_duration)
-            print_progress(seg_end, total_duration, start)
-            return res
-
-        model.decode = _patched_decode
-        try:
-            result = model.transcribe(input_file, **transcribe_kwargs)
-        finally:
-            model.decode = _orig_decode  # restore original
-
-        # Final 100% bar
         print_progress(total_duration, total_duration, start)
         print()  # newline after progress bar
-    else:
-        # No duration info → fall back to Whisper's verbose mode
-        transcribe_kwargs["verbose"] = True
-        result = model.transcribe(input_file, **transcribe_kwargs)
 
     elapsed = time.time() - start
     print(f"✅ Done in {format_duration_hms(elapsed)} ({elapsed / 60:.1f} min).")
+
+    # --- Post-processing: filter out hallucination loops ---
+    cleaned_segments = filter_hallucination(segments, max_repeat=3)
+    removed = len(segments) - len(cleaned_segments)
+    if removed:
+        print(f"   ⚠️  Filtered {removed} repeated segments (likely hallucination)")
 
     # --- Write output files ---
     base_name = os.path.splitext(os.path.basename(input_file))[0]
@@ -195,7 +274,7 @@ def transcribe_file(
     with open(txt_path, "w", encoding="utf-8") as f:
         next_marker = marker_interval if marker_interval > 0 else None
 
-        for seg in result["segments"]:
+        for seg in cleaned_segments:
             # Insert time marker if we've crossed the next boundary
             if next_marker is not None:
                 while seg["start"] >= next_marker:
@@ -210,13 +289,13 @@ def transcribe_file(
     # 2) Plain text (.txt) — no timestamps, easy to copy/paste or feed to AI
     plain_txt_path = os.path.join(outdir, f"{base_name}_plain.txt")
     with open(plain_txt_path, "w", encoding="utf-8") as f:
-        f.write(result["text"].strip())
+        f.write(" ".join(seg["text"].strip() for seg in cleaned_segments))
     print(f"   📄 Plain text:               {plain_txt_path}")
 
     # 3) SRT subtitles — standard format for video players
     srt_path = os.path.join(outdir, f"{base_name}.srt")
     with open(srt_path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(result["segments"], start=1):
+        for i, seg in enumerate(cleaned_segments, start=1):
             start_ts = format_timestamp(seg["start"])
             end_ts = format_timestamp(seg["end"])
             text = seg["text"].strip()
@@ -239,13 +318,13 @@ def main():
     default_output = os.path.join(project_root, "output")
 
     parser = argparse.ArgumentParser(
-        description="Transcribe video/audio to text using OpenAI Whisper (local, free)",
+        description="Transcribe video/audio to text using faster-whisper (local, free)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
   transcribe                          # process all files in input/ -> output/
   transcribe meeting.mp4              # process a single file -> output/
-  transcribe --model large-v3         # use the most accurate model (needs GPU)
+  transcribe --model large-v3         # use the most accurate model
   transcribe --marker-interval 600    # insert time markers every 10 minutes
   transcribe --marker-interval 0      # disable time markers
         """,
@@ -262,18 +341,25 @@ examples:
         default="medium",
         choices=["tiny", "base", "small", "medium", "large-v3"],
         help="Whisper model size. 'medium' balances speed/accuracy for Vietnamese. "
-             "'large-v3' is most accurate but much slower — GPU recommended. "
-             "(default: medium)",
+             "'large-v3' is most accurate and now feasible on CPU thanks to "
+             "CTranslate2 + int8 quantization. (default: medium)",
     )
     parser.add_argument(
         "--language",
-        default="Vietnamese",
-        help="Audio language (default: Vietnamese). Set to '' for auto-detection.",
+        default="vi",
+        help="Audio language code (default: vi = Vietnamese). "
+             "Set to '' for auto-detection.",
     )
     parser.add_argument(
         "--device",
-        default=None,
+        default="auto",
         help="'cuda' for NVIDIA GPU, 'cpu' to force CPU. Default: auto-detect.",
+    )
+    parser.add_argument(
+        "--compute-type",
+        default=None,
+        help="Quantization type: 'int8' (fastest, CPU), 'float16' (GPU), "
+             "'int8_float16' (GPU balanced). Default: auto (int8 for CPU, float16 for CUDA).",
     )
     parser.add_argument(
         "--outdir",
@@ -311,14 +397,25 @@ examples:
         print(f"📌 Time markers: disabled")
     print(f"📂 Output directory: {args.outdir}")
 
-    # --- Load Whisper model ---
-    import whisper  # import here so "not installed" error is clear after arg parsing
+    # --- Load faster-whisper model ---
+    from faster_whisper import WhisperModel
 
-    print(f"\n🔄 Loading model '{args.model}' (first run will download it, may take a few minutes)...")
-    load_kwargs = {}
-    if args.device:
-        load_kwargs["device"] = args.device
-    model = whisper.load_model(args.model, **load_kwargs)
+    # Auto-select compute type based on device
+    device = args.device
+    if device == "auto":
+        try:
+            import ctranslate2
+            device = "cuda" if "cuda" in ctranslate2.get_supported_compute_types("cuda") else "cpu"
+        except Exception:
+            device = "cpu"
+
+    compute_type = args.compute_type
+    if compute_type is None:
+        compute_type = "float16" if device == "cuda" else "int8"
+
+    print(f"\n🔄 Loading model '{args.model}' (device={device}, compute={compute_type})...")
+    print(f"   (First run will download the model, may take a few minutes)")
+    model = WhisperModel(args.model, device=device, compute_type=compute_type)
     print(f"✅ Model '{args.model}' ready.\n")
 
     # --- Process files ---
