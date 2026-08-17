@@ -416,7 +416,16 @@ examples:
         compute_type = "float16" if device == "cuda" else "int8"
 
     print(f"\n🔄 Loading model '{args.model}' (device={device}, compute={compute_type})...")
-    print(f"   (First run will download the model, may take a few minutes)")
+
+    # Check if model is already cached to avoid confusing "download" message
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        _cached = try_to_load_from_cache(f"Systran/faster-whisper-{args.model}", "model.bin")
+        if _cached is None or isinstance(_cached, str) is False:
+            print(f"   ⬇️  First run — downloading model, may take a few minutes...")
+    except Exception:
+        print(f"   (First run will download the model, may take a few minutes)")
+
     model = WhisperModel(args.model, device=device, compute_type=compute_type)
     print(f"✅ Model '{args.model}' ready.\n")
 
