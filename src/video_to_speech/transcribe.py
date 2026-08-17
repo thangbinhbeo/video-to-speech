@@ -267,10 +267,12 @@ def transcribe_file(
 
     # --- Write output files ---
     base_name = os.path.splitext(os.path.basename(input_file))[0]
-    os.makedirs(outdir, exist_ok=True)
+    # Each file gets its own subfolder under outdir
+    file_outdir = os.path.join(outdir, base_name)
+    os.makedirs(file_outdir, exist_ok=True)
 
     # 1) Timestamped transcript (.txt) — with optional time markers
-    txt_path = os.path.join(outdir, f"{base_name}_transcript.txt")
+    txt_path = os.path.join(file_outdir, f"{base_name}_transcript.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         next_marker = marker_interval if marker_interval > 0 else None
 
@@ -287,13 +289,13 @@ def transcribe_file(
     print(f"   📝 Transcript (timestamped): {txt_path}")
 
     # 2) Plain text (.txt) — no timestamps, easy to copy/paste or feed to AI
-    plain_txt_path = os.path.join(outdir, f"{base_name}_plain.txt")
+    plain_txt_path = os.path.join(file_outdir, f"{base_name}_plain.txt")
     with open(plain_txt_path, "w", encoding="utf-8") as f:
         f.write(" ".join(seg["text"].strip() for seg in cleaned_segments))
     print(f"   📄 Plain text:               {plain_txt_path}")
 
     # 3) SRT subtitles — standard format for video players
-    srt_path = os.path.join(outdir, f"{base_name}.srt")
+    srt_path = os.path.join(file_outdir, f"{base_name}.srt")
     with open(srt_path, "w", encoding="utf-8") as f:
         for i, seg in enumerate(cleaned_segments, start=1):
             start_ts = format_timestamp(seg["start"])
@@ -418,11 +420,26 @@ examples:
     model = WhisperModel(args.model, device=device, compute_type=compute_type)
     print(f"✅ Model '{args.model}' ready.\n")
 
-    # --- Process files ---
+    # --- Process files (skip those that already have output) ---
     total_start = time.time()
     success_count = 0
+    skipped_count = 0
 
     for i, fpath in enumerate(files_to_process, start=1):
+        base_name = os.path.splitext(os.path.basename(fpath))[0]
+        file_outdir = os.path.join(args.outdir, base_name)
+
+        # Check if output folder already has all 3 expected files
+        expected_files = [
+            os.path.join(file_outdir, f"{base_name}_transcript.txt"),
+            os.path.join(file_outdir, f"{base_name}_plain.txt"),
+            os.path.join(file_outdir, f"{base_name}.srt"),
+        ]
+        if all(os.path.isfile(f) for f in expected_files):
+            skipped_count += 1
+            print(f"\n⏭  [{i}/{len(files_to_process)}] Skipping '{base_name}' — output folder already exists")
+            continue
+
         if len(files_to_process) > 1:
             print(f"\n📋 [{i}/{len(files_to_process)}]", end="")
         try:
@@ -442,6 +459,7 @@ examples:
     print(f"\n{'=' * 60}")
     print(
         f"🏁 All done! {success_count}/{len(files_to_process)} files transcribed "
+        f"({skipped_count} skipped) "
         f"in {format_duration_hms(total_elapsed)}."
     )
     print(f"📂 Results saved to: {os.path.abspath(args.outdir)}")
