@@ -48,7 +48,7 @@ def get_media_duration(file_path: str) -> float | None:
             "-show_format",
             file_path,
         ]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
         if out.returncode == 0:
             info = json.loads(out.stdout)
             return float(info["format"]["duration"])
